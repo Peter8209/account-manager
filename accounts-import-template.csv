@@ -1,0 +1,4 @@
+email,username,display_name,bio,language,notes
+test1@example.com,test_user_1,Test User 1,,sk,technológie
+test2@example.com,test_user_2,Test User 2,,en,education
+test3@example.com,test_user_3,Test User 3,,de,digital tools
