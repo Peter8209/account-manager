@@ -1,12 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
-import { createSupabaseAdminClient } from '@/lib/supabase/admin';
-import { generateSafeBio } from '@/lib/accounts/generateSafeBio';
-import { makeUsername, requireAdminApiKey } from '@/lib/accounts/accountUtils';
+import { createSupabaseAdminClient } from '../../../../../lib/supabase/admin';
 
 export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+
+const ALLOWED_STATUSES = [
+  'draft',
+  'pending_verification',
+  'active',
+  'failed',
+  'blocked',
+] as const;
+
+type ManagedAccountStatus = (typeof ALLOWED_STATUSES)[number];
 
 type ImportRow = {
   email?: string;
@@ -15,122 +22,245 @@ type ImportRow = {
   displayName?: string;
   bio?: string;
   language?: string;
+  status?: string;
   notes?: string;
 };
 
-function normalizeRow(row: ImportRow) {
-  const email = String(row.email || '').trim().toLowerCase();
+type ManagedAccountPayload = {
+  email: string;
+  username: string;
+  display_name: string;
+  bio: string;
+  language: string;
+  status: ManagedAccountStatus;
+  source: string;
+  notes: string | null;
+  created_by: string;
+  updated_at: string;
+};
 
-  if (!email || !email.includes('@')) return null;
+function cleanText(value: unknown): string {
+  if (typeof value !== 'string') {
+    return '';
+  }
 
-  const language = String(row.language || 'sk').trim() || 'sk';
-  const username = String(row.username || '').trim() || makeUsername(email);
+  return value.trim();
+}
+
+function normalizeStatus(value: unknown): ManagedAccountStatus {
+  const status = cleanText(value);
+
+  if (ALLOWED_STATUSES.includes(status as ManagedAccountStatus)) {
+    return status as ManagedAccountStatus;
+  }
+
+  return 'draft';
+}
+
+function normalizeLanguage(value: unknown): string {
+  const language = cleanText(value).toLowerCase();
+
+  if (language === 'cz') {
+    return 'cs';
+  }
+
+  return language || 'sk';
+}
+
+function createSafeBio(
+  displayName: string,
+  username: string,
+  language: string
+): string {
+  const name = displayName || username;
+
+  if (language === 'en') {
+    return `${name} is a managed internal account created through the Account Manager panel.`;
+  }
+
+  if (language === 'cs') {
+    return `${name} je spravovaný interní účet vytvořený přes Account Manager panel.`;
+  }
+
+  return `${name} je spravovaný interný účet vytvorený cez Account Manager panel.`;
+}
+
+function isValidPayload(
+  item: ManagedAccountPayload | null
+): item is ManagedAccountPayload {
+  return item !== null;
+}
+
+function rowToPayload(
+  row: ImportRow,
+  createdBy: string
+): ManagedAccountPayload | null {
+  const email = cleanText(row.email).toLowerCase();
+  const username = cleanText(row.username);
   const displayName =
-    String(row.display_name || row.displayName || '').trim() || username;
+    cleanText(row.display_name) || cleanText(row.displayName);
+  const language = normalizeLanguage(row.language);
+  const status = normalizeStatus(row.status);
+  const notes = cleanText(row.notes);
+  const bioFromCsv = cleanText(row.bio);
+
+  if (!email || !username) {
+    return null;
+  }
+
+  const finalDisplayName = displayName || username;
 
   return {
     email,
     username,
-    display_name: displayName,
-    bio: String(row.bio || '').trim() || generateSafeBio({ language }),
+    display_name: finalDisplayName,
+    bio: bioFromCsv || createSafeBio(finalDisplayName, username, language),
     language,
-    status: 'pending',
-    source: 'import',
-    notes: String(row.notes || '').trim() || null,
-    created_by: 'admin-import',
+    status,
+    source: 'csv_import',
+    notes: notes || null,
+    created_by: createdBy,
     updated_at: new Date().toISOString(),
   };
 }
 
-async function parseFile(file: File): Promise<ImportRow[]> {
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const fileName = file.name.toLowerCase();
+async function parseCsvFile(file: File): Promise<ImportRow[]> {
+  const text = await file.text();
 
-  if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
-    const workbook = XLSX.read(buffer, {
-      type: 'buffer',
-    });
-
-    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json<ImportRow>(firstSheet, {
-      defval: '',
-    });
-
-    return rows;
-  }
-
-  const csv = buffer.toString('utf-8');
-
-  const parsed = Papa.parse<ImportRow>(csv, {
+  const result = Papa.parse<ImportRow>(text, {
     header: true,
     skipEmptyLines: true,
+    transformHeader: (header) => header.trim(),
   });
 
-  return parsed.data;
+  if (result.errors.length > 0) {
+    throw new Error(
+      result.errors[0]?.message || 'CSV súbor sa nepodarilo spracovať.'
+    );
+  }
+
+  return result.data;
 }
 
-export async function POST(req: NextRequest) {
-  const auth = requireAdminApiKey(req);
+async function parseExcelFile(file: File): Promise<ImportRow[]> {
+  const arrayBuffer = await file.arrayBuffer();
+  const workbook = XLSX.read(arrayBuffer, { type: 'array' });
 
-  if (!auth.ok) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: auth.error,
-      },
-      { status: 401 },
-    );
+  const firstSheetName = workbook.SheetNames[0];
+
+  if (!firstSheetName) {
+    throw new Error('Excel súbor neobsahuje žiadny hárok.');
   }
 
-  const formData = await req.formData();
-  const file = formData.get('file');
+  const worksheet = workbook.Sheets[firstSheetName];
 
-  if (!(file instanceof File)) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: 'Chýba importovaný súbor.',
-      },
-      { status: 400 },
-    );
+  if (!worksheet) {
+    throw new Error('Nepodarilo sa načítať prvý hárok Excel súboru.');
   }
 
-  const rows = await parseFile(file);
-  const payload = rows.map(normalizeRow).filter(Boolean);
-
-  if (!payload.length) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: 'Súbor neobsahuje žiadne platné účty.',
-      },
-      { status: 400 },
-    );
-  }
-
-  const supabase = createSupabaseAdminClient();
-
-  const { data, error } = await supabase
-    .from('managed_accounts')
-    .upsert(payload, {
-      onConflict: 'email',
-      ignoreDuplicates: false,
-    })
-    .select('*');
-
-  if (error) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: error.message,
-      },
-      { status: 500 },
-    );
-  }
-
-  return NextResponse.json({
-    ok: true,
-    imported: data?.length || 0,
-    items: data || [],
+  return XLSX.utils.sheet_to_json<ImportRow>(worksheet, {
+    defval: '',
   });
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const supabase = createSupabaseAdminClient();
+    const formData = await request.formData();
+
+    const file = formData.get('file');
+    const createdBy = cleanText(formData.get('created_by')) || 'system';
+
+    if (!(file instanceof File)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'Chýba súbor na import.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const fileName = file.name.toLowerCase();
+
+    let rows: ImportRow[] = [];
+
+    if (fileName.endsWith('.csv')) {
+      rows = await parseCsvFile(file);
+    } else if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
+      rows = await parseExcelFile(file);
+    } else {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'Podporované sú iba súbory CSV, XLS alebo XLSX.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const payload = rows
+      .map((row) => rowToPayload(row, createdBy))
+      .filter(isValidPayload);
+
+    if (payload.length === 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            'Import neobsahuje žiadne platné riadky. Povinné polia sú email a username.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const { data, error } = await supabase
+      .from('managed_accounts')
+      .upsert(payload, {
+        onConflict: 'email',
+        ignoreDuplicates: false,
+      })
+      .select();
+
+    if (error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: error.message,
+        },
+        { status: 500 }
+      );
+    }
+
+    const { error: auditError } = await supabase.from('audit_logs').insert({
+      action: 'managed_accounts_imported',
+      entity_type: 'managed_account',
+      entity_id: null,
+      metadata: {
+        file_name: file.name,
+        imported_count: data?.length ?? payload.length,
+        source: 'csv_excel_import',
+        created_by: createdBy,
+      },
+    });
+
+    return NextResponse.json({
+      ok: true,
+      imported: data?.length ?? payload.length,
+      accounts: data ?? [],
+      audit_logged: !auditError,
+      audit_error: auditError?.message ?? null,
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Import účtov zlyhal.',
+      },
+      { status: 500 }
+    );
+  }
 }

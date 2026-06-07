@@ -1,4 +1,4 @@
-type BumbleConnectorStatus = {
+export type BumbleConnectorStatus = {
   configured: boolean;
   mode: 'not_configured' | 'official_api_ready';
   appStoreUrl: string;
@@ -17,8 +17,8 @@ export function getBumbleConnectorStatus(): BumbleConnectorStatus {
     appStoreUrl:
       'https://apps.apple.com/sk/app/bumble-dating-app-meet-date/id930441707?l=sk',
     message: configured
-      ? 'Bumble official connector je nakonfigurovaný pre oficiálne API.'
-      : 'Bumble official connector nie je nakonfigurovaný. Doplň oficiálne API údaje.',
+      ? 'Bumble Official Connector je pripravený na volanie oficiálneho API.'
+      : 'Bumble Official Connector nie je nakonfigurovaný. Doplň oficiálne API base URL a API key.',
   };
 }
 
@@ -30,7 +30,8 @@ export async function testBumbleOfficialApi() {
     return {
       ok: false,
       status: 'not_configured',
-      message: 'Chýba BUMBLE_OFFICIAL_API_BASE_URL alebo BUMBLE_OFFICIAL_API_KEY.',
+      message:
+        'Chýba BUMBLE_OFFICIAL_API_BASE_URL alebo BUMBLE_OFFICIAL_API_KEY. Bez oficiálneho API ostáva modul v bezpečnom režime.',
     };
   }
 
@@ -47,7 +48,7 @@ export async function testBumbleOfficialApi() {
     ok: response.ok,
     status: response.status,
     message: response.ok
-      ? 'Oficiálne Bumble API odpovedá.'
+      ? 'Oficiálne Bumble API odpovedá správne.'
       : 'Oficiálne Bumble API neodpovedá správne.',
   };
 }
